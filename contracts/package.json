@@ -1,0 +1,32 @@
+{
+  "name": "contracts",
+  "private": true,
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "nodeos": "nodeos -e -p eosio --plugin eosio::wallet_api_plugin --plugin eosio::chain_api_plugin --plugin eosio::history_api_plugin --contracts-console --access-control-allow-origin=*",
+    "nodeos:docker": "docker run -d --rm --name eosio -p 8888:8888 -p 9876:9876 -v $(pwd)/EOSPixels:/EOSPixels -v /tmp/work:/work -v /tmp/eosio/data:/mnt/dev/data -v /tmp/eosio/config:/mnt/dev/config eosio/eos-dev@sha256:8f1841f71332109d8281cbd4197751933f2bf4fb5e77db189908bb77782b19df /bin/bash -c 'nodeos -e -p eosio --plugin eosio::wallet_api_plugin --plugin eosio::wallet_plugin --plugin eosio::producer_plugin --plugin eosio::history_plugin --plugin eosio::chain_api_plugin --plugin eosio::history_api_plugin --plugin eosio::http_plugin -d /mnt/dev/data --config-dir /mnt/dev/config --http-server-address=0.0.0.0:8888 --access-control-allow-origin=* --contracts-console --http-validate-host=false'",
+    "initialize": "node scripts/init.js",
+    "compile": "eosiocpp -o EOSPixels/EOSPixels.wast EOSPixels/EOSPixels.cpp && eosiocpp -g EOSPixels/EOSPixels.abi EOSPixels/EOSPixels.cpp",
+    "compile:docker": "docker exec -it eosio /bin/bash -c 'eosiocpp -o EOSPixels/EOSPixels.wast EOSPixels/EOSPixels.cpp && eosiocpp -g EOSPixels/EOSPixels.abi EOSPixels/EOSPixels.cpp'",
+    "deploy": "node scripts/deploy.js",
+    "start": "npm run initialize && npm run compile && npm run deploy && npm run @init",
+    "start:docker": "npm run initialize && npm run compile:docker && npm run deploy && npm run @init",
+    "update-contract": "npm run compile && npm run deploy",
+    "update-contract:docker": "npm run compile:docker && npm run deploy",
+    "dump-tables": "node scripts/dump_tables.js",
+    "update-auth": "node scripts/update_auth.js",
+    "buy-ram": "node scripts/buy_ram.js",
+    "@init": "node actions/init.js",
+    "@end": "node actions/end.js",
+    "@autoend": "node actions/autoend.js",
+    "@withdraw": "node actions/withdraw.js",
+    "clear:docker": "rm -rf /tmp/work && rm -rf /tmp/eosio"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "binaryen": "^48.0.0",
+    "dotenv": "^6.0.0",
+    "eosjs": "^16.0.0"
+  }
+}
