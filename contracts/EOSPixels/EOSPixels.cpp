@@ -1,36 +1,14 @@
-#include "./EOSPixels.hpp"
+#include "EOSPixels.hpp"
 
 #include <cmath>
 #include <eosiolib/action.hpp>
 #include <eosiolib/asset.hpp>
 
+#include "memo.hpp"
+#include "types.hpp"
+
 using namespace eosio;
 using namespace std;
-
-inline void unpackMemo(string memo, uint16_t &priceCounter,
-                       uint32_t &coordinate, uint32_t &color) {
-  uint128_t memoInt = stoull(memo, 0, 36);
-  priceCounter = memoInt >> 52;
-  coordinate = memoInt >> 32 & 0xFFFFF;
-  color = memoInt & 0xFFFFFFFF;
-}
-
-inline uint64_t priceCounterToPrice(uint16_t priceCounter) {
-  return DEFAULT_PRICE * pow(PRICE_MULTIPLIER, priceCounter) * 1E4;
-}
-
-inline void splitMemo(vector<string> &results, string memo, char separator) {
-  auto start = memo.cbegin();
-  auto end = memo.cend();
-
-  for (auto it = start; it != end; ++it) {
-    if (*it == separator) {
-      results.emplace_back(start, it);
-      start = it + 1;
-    }
-  }
-  if (start != end) results.emplace_back(start, end);
-}
 
 template <uint64_t A, typename B, typename... C>
 void clear_table(multi_index<A, B, C...> *table, uint16_t limit) {
@@ -85,118 +63,126 @@ void eospixels::clearcanvs(uint16_t count, uint16_t nonce) {
   clear_table(&canvases, count);
 }
 
-void eospixels::onTransfer(const currency::transfer &transfer) {
-  if (transfer.to != _self) return;
+void eospixels::resetquota() {
+  require_auth(TEAM_ACCOUNT);
 
-  auto accountTtr = accounts.find(transfer.from);
-  eosio_assert(accountTtr != accounts.end(), "account doesn't exist");
-
-  auto canvasItr = canvases.begin();
-  eosio_assert(canvasItr != canvases.end(), "game is not started yet");
-  auto canvas = *canvasItr;
-  eosio_assert(!canvas.isEnded(), "canvas had ended");
-
-  std::vector<std::string> memo;
-  splitMemo(memo, transfer.memo, ';');
-
-  string orders = memo[0];
-
-  std::vector<std::string> pixelOrders;
-  splitMemo(pixelOrders, orders, ',');
-
-  int64_t leftAmount = transfer.quantity.amount;
-  int64_t commission = 0;
-  pixel_store pixels(_self, canvas.id);
-  pixel_store *pixelsPtr = &pixels;
-  for (auto pixelOrder : pixelOrders) {
-    draw(transfer.from, pixelOrder, leftAmount, pixelsPtr, commission);
+  auto guardItr = guards.begin();
+  if (guardItr == guards.end()) {
+    guards.emplace(_self, [&](guard &grd) {
+      grd.id = 0;
+      grd.quota = WITHDRAW_QUOTA;
+    });
+  } else {
+    guards.modify(guardItr, 0, [&](guard &grd) { grd.quota = WITHDRAW_QUOTA; });
   }
-
-  if (leftAmount > 0) {
-    deposit(transfer.from, asset(leftAmount, EOS_SYMBOL));
-  }
-
-  int64_t cost = transfer.quantity.amount - leftAmount;
-  if (cost == 0) {
-    return;
-  }
-
-  refreshLastPaintedAt();
-
-  if (commission == 0) {
-    return;
-  }
-
-  if (memo.size() == 2) {
-    string referrer = memo[1];
-    int64_t referrerCommission =
-        REFERRER_COMMISSION_PERCENTAGE_POINTS * commission;
-    if (referrerCommission > 0) {
-      deposit(string_to_name(referrer.c_str()),
-              asset(referrerCommission, EOS_SYMBOL));
-
-      commission -= referrerCommission;
-      if (commission == 0) {
-        return;
-      }
-    }
-  }
-
-  deposit(TEAM_ACCOUNT, asset(commission, EOS_SYMBOL));
 }
 
-void eospixels::draw(const account_name user, string pixelOrder,
-                     int64_t &amount, pixel_store *allPixels,
-                     int64_t &commission) {
-  uint32_t coordinate;
-  uint32_t color;
-  uint16_t bidPriceCounter;
-  unpackMemo(pixelOrder, bidPriceCounter, coordinate, color);
-  uint64_t bidPrice = priceCounterToPrice(bidPriceCounter);
+// FIXME change allPixels to a reference?
+void eospixels::drawPixel(pixel_store &allPixels,
+                          const st_pixelOrder &pixelOrder,
+                          st_transferContext &ctx) {
+  auto loc = pixelOrder.location();
 
-  eosio_assert(bidPrice > 0 && amount >= bidPrice, "wrong price");
-  eosio_assert((coordinate >> 10) < MAX_COORDINATE_Y_PLUS_ONE,
-               "invalid coordinate y");
-  eosio_assert((coordinate & 0x3ff) < MAX_COORDINATE_X_PLUS_ONE,
-               "invalid coordinate x");
+  auto pixelRowItr = allPixels.find(loc.row);
 
-  uint16_t row = coordinate / PIXELS_PER_ROW;
-  uint16_t col = coordinate - PIXELS_PER_ROW * row;
-  auto pixelRowItr = allPixels->find(row);
-  bool hasRow = pixelRowItr != allPixels->end();
+  // TODO extract this into its own method
+  // Emplace & initialize empty row if it doesn't already exist
+  bool hasRow = pixelRowItr != allPixels.end();
   if (!hasRow) {
-    pixelRowItr = allPixels->emplace(
-        _self, [&](pixel_row &pixelRow) { pixelRow.row = row; });
+    pixelRowItr = allPixels.emplace(_self, [&](pixel_row &pixelRow) {
+      pixelRow.row = loc.row;
+      pixelRow.initialize_empty_pixels();
+    });
   }
 
   auto pixels = pixelRowItr->pixels;
-  auto pixel = pixels[col];
-  auto hadPaintedBefore = hasRow && pixel.owner != account_name();
+  auto pixel = pixels[loc.col];
 
-  if (hadPaintedBefore && color == pixel.color) {
-    // unnecessary paint
+  auto result = ctx.purchase(pixel, pixelOrder);
+  if (result.isSkipped) {
     return;
   }
 
-  uint16_t priceCounter = hadPaintedBefore ? (pixel.priceCounter) + 1 : 0;
-  if (bidPriceCounter < priceCounter) {
-    // payment not enough
-    return;
-  }
-
-  uint64_t pixelPrice = priceCounterToPrice(priceCounter);
-  // don't use bidPrice here, allow user to bid a higher price.
-  amount -= pixelPrice;
-
-  int64_t rewardForLastPaint = (1 - COMMISSION_PERCENTAGE_POINTS) * pixelPrice;
-  commission += pixelPrice - rewardForLastPaint;
-
-  allPixels->modify(pixelRowItr, 0, [&](pixel_row &pixelRow) {
-    pixelRow.pixels[col] = {color, priceCounter, user};
+  allPixels.modify(pixelRowItr, 0, [&](pixel_row &pixelRow) {
+    pixelRow.pixels[loc.col] = {pixelOrder.color, pixel.nextPriceCounter(),
+                                ctx.purchaser};
   });
 
-  if (hadPaintedBefore) {
-    deposit(pixel.owner, asset(rewardForLastPaint, EOS_SYMBOL));
+  if (!result.isFirstBuyer) {
+    deposit(pixel.owner, result.ownerEarningScaled);
+  }
+}
+
+bool eospixels::isValidReferrer(account_name name) {
+  auto it = accounts.find(name);
+
+  if (it == accounts.end()) {
+    return false;
+  }
+
+  // referrer must have painted at least one pixel
+  return it->pixelsDrawn > 0;
+}
+
+void eospixels::onTransfer(const currency::transfer &transfer) {
+  if (transfer.to != _self) return;
+
+  auto canvasItr = canvases.begin();
+  eosio_assert(canvasItr != canvases.end(), "game not started");
+  auto canvas = *canvasItr;
+  eosio_assert(!canvas.isEnded(), "game ended");
+
+  auto from = transfer.from;
+  auto accountItr = accounts.find(from);
+  eosio_assert(accountItr != accounts.end(),
+               "account not registered to the game");
+
+  pixel_store allPixels(_self, canvas.id);
+
+  auto memo = TransferMemo();
+  memo.parse(transfer.memo);
+
+  auto ctx = st_transferContext();
+  ctx.amountLeft = transfer.quantity.amount;
+  ctx.purchaser = transfer.from;
+  ctx.referrer = memo.referrer;
+
+  // Remove referrer if it is invalid
+  if (ctx.referrer != 0 &&
+      (ctx.referrer == from || !isValidReferrer(ctx.referrer))) {
+    ctx.referrer = 0;
+  }
+
+  // Every pixel has a "fee". For IPO the fee is the whole pixel price. For
+  // takeover, the fee is a percentage of the price increase.
+
+  for (auto &pixelOrder : memo.pixelOrders) {
+    drawPixel(allPixels, pixelOrder, ctx);
+  }
+
+  size_t paintSuccessPercent =
+      ctx.paintedPixelCount * 100 / memo.pixelOrders.size();
+  eosio_assert(paintSuccessPercent >= 80, "Too many pixels did not paint.");
+
+  if (ctx.amountLeft > 0) {
+    // Refund user with whatever is left over
+    deposit(from, ctx.amountLeftScaled());
+  }
+
+  ctx.updateFeesDistribution();
+
+  canvases.modify(canvasItr, 0, [&](auto &cv) {
+    cv.lastPaintedAt = now();
+    cv.lastPainter = from;
+
+    ctx.updateCanvas(cv);
+  });
+
+  accounts.modify(accountItr, 0,
+                  [&](account &acct) { ctx.updatePurchaserAccount(acct); });
+
+  if (ctx.hasReferrer()) {
+    deposit(ctx.referrer, ctx.referralEarningScaled);
   }
 }
 
@@ -249,7 +235,7 @@ void eospixels::createacct(const account_name account) {
   auto itr = accounts.find(account);
   eosio_assert(itr == accounts.end(), "account already exist");
 
-  accounts.emplace(account, [&](auto &acnt) { acnt.owner = account; });
+  accounts.emplace(account, [&](auto &acct) { acct.owner = account; });
 }
 
 void eospixels::init() {
@@ -277,38 +263,49 @@ void eospixels::init() {
 //   }
 // }
 
-void eospixels::withdraw(const account_name to, const asset &quantity) {
+void eospixels::withdraw(const account_name to) {
   require_auth(to);
 
-  eosio_assert(quantity.is_valid(), "invalid quantity");
-  eosio_assert(quantity.amount > 0, "must withdraw positive quantity");
+  auto canvasItr = canvases.begin();
+  eosio_assert(canvasItr != canvases.end(), "no canvas exists");
 
-  auto itr = accounts.find(to);
-  eosio_assert(itr != accounts.end(), "unknown account");
+  auto canvas = *canvasItr;
+  eosio_assert(canvas.pixelsDrawn >= WITHDRAW_PIXELS_THRESHOLD,
+               "canvas still in game initialization");
 
-  accounts.modify(itr, 0, [&](auto &acnt) {
-    eosio_assert(acnt.balance >= quantity, "insufficient balance");
-    acnt.balance -= quantity;
+  auto acctItr = accounts.find(to);
+  eosio_assert(acctItr != accounts.end(), "unknown account");
+
+  auto guardItr = guards.begin();
+  eosio_assert(guardItr != guards.end(), "no withdraw guard exists");
+
+  auto player = *acctItr;
+  auto grd = *guardItr;
+
+  uint64_t withdrawAmount = calculateWithdrawalAndUpdate(canvas, player, grd);
+
+  guards.modify(guardItr, 0, [&](guard &g) { g.quota = grd.quota; });
+
+  accounts.modify(acctItr, 0, [&](account &acct) {
+    acct.balanceScaled = player.balanceScaled;
+    acct.maskScaled = player.maskScaled;
   });
 
+  auto quantity = asset(withdrawAmount, EOS_SYMBOL);
   action(permission_level{_self, N(active)}, N(eosio.token), N(transfer),
          std::make_tuple(_self, to, quantity,
                          std::string("Withdraw from EOS Pixels")))
       .send();
 }
 
-void eospixels::deposit(const account_name user, const asset &quantity) {
-  eosio_assert(quantity.is_valid(), "invalid quantity");
-  eosio_assert(quantity.amount > 0, "must deposit positive quantity");
+void eospixels::deposit(const account_name user,
+                        const uint128_t quantityScaled) {
+  eosio_assert(quantityScaled > 0, "must deposit positive quantity");
 
   auto itr = accounts.find(user);
-  if (itr == accounts.end()) {
-    // in the case of invalid referrer, we deposit commission to team account
-    itr = accounts.find(TEAM_ACCOUNT);
-    eosio_assert(itr != accounts.end(), "team account is not exist");
-  }
 
-  accounts.modify(itr, 0, [&](auto &acnt) { acnt.balance += quantity; });
+  accounts.modify(itr, 0,
+                  [&](auto &acct) { acct.balanceScaled += quantityScaled; });
 }
 
 void eospixels::apply(account_name contract, action_name act) {
@@ -330,7 +327,7 @@ void eospixels::apply(account_name contract, action_name act) {
   switch (act) {
     // first argument is name of CPP class, not contract
     EOSIO_API(eospixels, (init)(refresh)(changedur)(end)(createacct)(withdraw)(
-                             clearpixels)(clearaccts)(clearcanvs))
+                             clearpixels)(clearaccts)(clearcanvs)(resetquota))
   };
 }
 

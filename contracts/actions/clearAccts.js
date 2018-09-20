@@ -4,8 +4,8 @@ const { getErrorDetail, sleep } = require(`../utils`)
 const { EOS_CONTRACT_NAME, TESTER_NAME } = process.env
 
 async function action() {
-  let total = 1000
-  const perBatch = 500
+  let total = 100
+  const perBatch = 100
   const perTx = 100
   const contract = await eos.contract(EOS_CONTRACT_NAME)
   while (total) {
