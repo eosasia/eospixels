@@ -152,7 +152,12 @@ uint64_t calculateWithdrawalAndUpdate(const canvas &cnv, account &player,
   uint128_t withdrawnBonusScaled = patronBonus * PRECISION_BASE;
   uint128_t withdrawnBalanceScaled = balance * PRECISION_BASE;
 
-  player.balanceScaled -= withdrawnBalanceScaled;
+  // Due to precision issues in PRECISION_BASE, withdrawnBalanceScaled  may cause overflow.
+  if (withdrawnBalanceScaled >= player.balanceScaled) {
+    player.balanceScaled = 0;
+  } else {
+    player.balanceScaled -= withdrawnBalanceScaled;
+  }
   player.maskScaled += withdrawnBonusScaled;
 
   return withdrawAmount;
